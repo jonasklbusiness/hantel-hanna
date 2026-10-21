@@ -1,19 +1,35 @@
 'use strict';
 
 /* Hantel-Hanna – Hannas Trainingsplan.
+   Aufbau: Pläne (z. B. Upper, Lower) → Übungen im Plan → Einträge (Gewicht pro Tag).
    Alle Daten liegen nur lokal auf dem Handy (localStorage). */
 
 const STORE_KEY = 'hantel-hanna-v1';
 const STEPS = [1, 2.5, 5];
-const GROUPS = ['Beine', 'Po', 'Rücken', 'Brust', 'Schultern', 'Arme', 'Bauch', 'Cardio'];
-const SUGGESTIONS = [
-  ['Beinpresse', 'Beine'], ['Beinstrecker', 'Beine'], ['Beinbeuger', 'Beine'], ['Kniebeugen', 'Beine'],
-  ['Adduktoren', 'Beine'], ['Abduktoren', 'Po'], ['Hip Thrust', 'Po'],
-  ['Latzug', 'Rücken'], ['Rudern sitzend', 'Rücken'], ['Rückenstrecker', 'Rücken'],
-  ['Brustpresse', 'Brust'], ['Butterfly', 'Brust'],
-  ['Schulterpresse', 'Schultern'], ['Seitheben', 'Schultern', 1],
-  ['Bizeps-Curls', 'Arme', 1], ['Trizepsdrücken', 'Arme'], ['Bauchpresse', 'Bauch'],
+const PLAN_NAMES = ['Upper', 'Lower', 'Push', 'Pull', 'Beine', 'Oberkörper', 'Unterkörper', 'Ganzkörper', 'Tag A', 'Tag B'];
+const TEMPLATES = [
+  ['Upper / Lower', ['Upper', 'Lower']],
+  ['Push / Pull / Beine', ['Push', 'Pull', 'Beine']],
+  ['Ganzkörper', ['Ganzkörper']],
 ];
+const SUGGESTIONS = {
+  lower: ['Beinpresse', 'Kniebeugen', 'Beinstrecker', 'Beinbeuger', 'Hip Thrust', 'Rumänisches Kreuzheben', 'Ausfallschritte', 'Abduktoren', 'Adduktoren', 'Wadenheben'],
+  push: ['Bankdrücken', 'Brustpresse', 'Butterfly', 'Schulterpresse', 'Seitheben', 'Trizepsdrücken'],
+  pull: ['Latzug', 'Rudern sitzend', 'Klimmzüge', 'Face Pulls', 'Bizeps-Curls'],
+  core: ['Bauchpresse', 'Rückenstrecker'],
+};
+const SMALL_STEPS = ['Seitheben', 'Bizeps-Curls']; // Kurzhanteln: 1-kg-Schritte
+
+// Passende Vorschläge zum Plan-Namen („Lower“ → Beinübungen usw.)
+function suggestionsFor(planName) {
+  const n = planName.toLowerCase();
+  const kinds = /low|bein|leg|unter/.test(n) ? ['lower', 'core']
+    : /upper|ober/.test(n) ? ['push', 'pull', 'core']
+    : /push|drück/.test(n) ? ['push', 'core']
+    : /pull|zieh/.test(n) ? ['pull', 'core']
+    : ['lower', 'push', 'pull', 'core'];
+  return kinds.flatMap(k => SUGGESTIONS[k]);
+}
 
 /* ---------- Kleine Helfer ---------- */
 
@@ -50,6 +66,13 @@ function shiftMonth(month, n) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
 }
 
+function shake(el) {
+  el.classList.remove('shake');
+  void el.offsetWidth;
+  el.classList.add('shake');
+  el.focus();
+}
+
 /* ---------- Icons ---------- */
 
 const ICONS = {
@@ -60,6 +83,7 @@ const ICONS = {
   left: 'M15 18l-6-6 6-6',
   right: 'M9 6l6 6-6 6',
   up: 'M12 19V6M6.5 11.5 12 6l5.5 5.5',
+  down: 'M12 5v13M6.5 12.5 12 18l5.5-5.5',
   edit: 'M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4zM13.5 6.5l4 4',
   chart: 'M3 17l6-6 4 4 8-8M15 7h6v6',
   calendar: 'M7 3v3M17 3v3M4 10h16M6 5h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z',
@@ -80,26 +104,46 @@ const LOGO = `<svg class="logo" viewBox="0 0 64 64" aria-hidden="true"><rect wid
 /* ---------- Daten ---------- */
 
 function emptyData() {
-  return { version: 1, exercises: [], logs: [], lastBackup: null };
+  return { version: 2, plans: [], exercises: [], logs: [], lastBackup: null };
 }
 
 // Prüft und bereinigt Daten (beim Start und beim Backup-Laden).
 function sanitize(d) {
   if (!d || !Array.isArray(d.exercises) || !Array.isArray(d.logs)) return null;
+  const isDate = v => /^\d{4}-\d\d-\d\d$/.test(v);
   const weight = v => Math.max(0, round2(parseNum(v)));
   const count = (v, def) => clamp(parseInt(v, 10) || def, 1, 99);
-  const exercises = d.exercises.filter(e => e && e.id && e.name).map(e => ({
-    id: String(e.id), name: String(e.name), group: String(e.group || ''), note: String(e.note || ''),
-    weight: weight(e.weight), sets: count(e.sets, 3), reps: count(e.reps, 10),
-    step: STEPS.includes(Number(e.step)) ? Number(e.step) : 2.5, createdAt: Number(e.createdAt) || 0,
-  }));
+
+  const plans = (Array.isArray(d.plans) ? d.plans : []).filter(p => p && p.id && p.name)
+    .map(p => ({ id: String(p.id), name: String(p.name) }));
+  const planIds = new Set(plans.map(p => p.id));
+  let fallback = null; // Übungen ohne Plan (ältere Version) landen in „Mein Training“
+
+  const exercises = d.exercises.filter(e => e && e.id && e.name).map(e => {
+    let planId = String(e.planId || '');
+    if (!planIds.has(planId)) {
+      if (!fallback) {
+        fallback = { id: uid(), name: 'Mein Training' };
+        plans.push(fallback);
+        planIds.add(fallback.id);
+      }
+      planId = fallback.id;
+    }
+    return {
+      id: String(e.id), planId, name: String(e.name), note: String(e.note || ''),
+      weight: weight(e.weight), sets: count(e.sets, 3), reps: count(e.reps, 10),
+      step: STEPS.includes(Number(e.step)) ? Number(e.step) : 2.5, createdAt: Number(e.createdAt) || 0,
+    };
+  });
+
   const ids = new Set(exercises.map(e => e.id));
   const perDay = new Map(); // höchstens ein Eintrag pro Übung und Tag
-  d.logs.filter(l => l && ids.has(String(l.exId)) && /^\d{4}-\d\d-\d\d$/.test(l.date)).map(l => ({
+  d.logs.filter(l => l && ids.has(String(l.exId)) && isDate(l.date)).forEach(l => perDay.set(`${l.exId}|${l.date}`, {
     id: String(l.id || uid()), exId: String(l.exId), date: l.date,
     weight: weight(l.weight), sets: count(l.sets, 3), reps: count(l.reps, 10), ts: Number(l.ts) || 0,
-  })).forEach(l => perDay.set(`${l.exId}|${l.date}`, l));
-  return { version: 1, exercises, logs: [...perDay.values()], lastBackup: /^\d{4}-\d\d-\d\d$/.test(d.lastBackup) ? d.lastBackup : null };
+  }));
+
+  return { version: 2, plans, exercises, logs: [...perDay.values()], lastBackup: isDate(d.lastBackup) ? d.lastBackup : null };
 }
 
 function load() {
@@ -117,8 +161,13 @@ function save() {
   if (!askedPersist) { askedPersist = true; navigator.storage?.persist?.().catch(() => {}); }
 }
 
-const newExercise = v => ({ id: uid(), name: '', group: '', note: '', weight: 0, sets: 3, reps: 10, step: 2.5, createdAt: Date.now(), ...v });
+// Für Rückgängig: kompletter Stand vor einer Löschung.
+const snapshot = () => ({ plans: [...data.plans], exercises: [...data.exercises], logs: [...data.logs] });
+
+const newExercise = v => ({ id: uid(), planId: '', name: '', note: '', weight: 0, sets: 3, reps: 10, step: 2.5, createdAt: Date.now(), ...v });
+const planById = id => data.plans.find(p => p.id === id);
 const exById = id => data.exercises.find(e => e.id === id);
+const exercisesOf = planId => data.exercises.filter(e => e.planId === planId);
 const byDate = (a, b) => a.date.localeCompare(b.date) || a.ts - b.ts;
 const logsOf = id => data.logs.filter(l => l.exId === id).sort(byDate);
 const logOn = (id, date) => data.logs.find(l => l.exId === id && l.date === date);
@@ -130,14 +179,23 @@ function isRecord(log) {
   return earlier.length > 0 && log.weight > Math.max(...earlier.map(l => l.weight));
 }
 
-const groupRank = g => { const i = GROUPS.indexOf(g); return i >= 0 ? i : g ? 50 : 99; };
-const usedGroups = () => [...new Set(data.exercises.map(e => e.group))]
-  .sort((a, b) => groupRank(a) - groupRank(b) || a.localeCompare(b, 'de'));
-const groupName = g => g || 'Weitere';
+// Letzter Tag, an dem eine Übung aus dem Plan eingetragen wurde.
+function lastTrained(planId) {
+  const ids = new Set(exercisesOf(planId).map(e => e.id));
+  return data.logs.reduce((last, l) => (ids.has(l.exId) && l.date > last ? l.date : last), '') || null;
+}
+
+// Welcher Plan ist heute dran? Der heute schon begonnene – sonst der, der am längsten her ist.
+function nextPlan() {
+  const plans = data.plans.filter(p => exercisesOf(p.id).length);
+  return plans.find(p => lastTrained(p.id) === today())
+    || [...plans].sort((a, b) => (lastTrained(a.id) || '').localeCompare(lastTrained(b.id) || ''))[0]
+    || null;
+}
 
 /* ---------- Ansichten ---------- */
 
-const ui = { tab: 'training', group: '*', month: today().slice(0, 7), picked: new Set() };
+const ui = { tab: 'training', plan: null, month: today().slice(0, 7), picked: new Set() };
 
 function renderChrome() {
   $('#top').innerHTML = `<div class="bar-in">
@@ -156,6 +214,7 @@ function render() {
 }
 
 const weightText = w => w > 0 ? `${kg(w)} kg` : 'ohne Gewicht';
+const progressBar = (done, total) => done ? `<span class="progress"><i style="width:${(done / total) * 100}%"></i></span>` : '';
 
 const emptyState = (ic, title, text) =>
   `<div class="empty"><div class="empty-ic">${icon(ic)}</div><h2>${title}</h2><p>${text}</p></div>`;
@@ -165,42 +224,108 @@ function greeting() {
   return h >= 5 && h < 11 ? 'Guten Morgen' : h >= 18 && h < 23 ? 'Guten Abend' : 'Hey';
 }
 
-/* Training */
+function backupBanner() {
+  const due = data.logs.length >= 8 && (!data.lastBackup || daysAgo(data.lastBackup) > 30);
+  return due ? `<button class="banner" data-action="settings">${icon('save')}
+    <span><b>Zeit für ein Backup</b>Dauert 5 Sekunden – sicher ist sicher.</span>${icon('right')}</button>` : '';
+}
+
+/* Training: Übersicht der Pläne */
 
 function viewTraining() {
-  if (!data.exercises.length) return viewWelcome();
+  const plan = planById(ui.plan);
+  if (plan) return viewPlan(plan);
+  ui.plan = null;
+  if (!data.plans.length) return viewWelcome();
 
   const t = today();
-  const groups = usedGroups();
-  if (ui.group !== '*' && !groups.includes(ui.group)) ui.group = '*';
-  const visible = data.exercises.filter(e => ui.group === '*' || e.group === ui.group);
-  const done = visible.filter(e => logOn(e.id, t)).length;
-  const days = trainingDays();
-
-  const sub = done
-    ? (done === visible.length ? 'Alles geschafft für heute – stark! 🎉' : `Heute schon ${done} von ${visible.length} geschafft.`)
-    : days.length ? `Letztes Training: ${relDay(days[0])}` : 'Tipp auf eine Übung, um dein Gewicht einzutragen.';
-
-  const needBackup = data.logs.length >= 8 && (!data.lastBackup || daysAgo(data.lastBackup) > 30);
-
-  const list = ui.group === '*' && groups.length > 1
-    ? groups.map(g => `<h2 class="group-title">${esc(groupName(g))}</h2>
-        <div class="cards">${visible.filter(e => e.group === g).map(cardExercise).join('')}</div>`).join('')
-    : `<div class="cards">${visible.map(cardExercise).join('')}</div>`;
+  const next = nextPlan();
+  const sub = !next ? 'Tipp auf einen Plan und füg deine Übungen hinzu.'
+    : lastTrained(next.id) === t ? `Heute: <b>${esc(next.name)}</b> – weiter so!`
+    : `Heute dran: <b>${esc(next.name)}</b>`;
 
   return `
     <header class="hello">
       <p class="eyebrow">${fmtDate(t, { weekday: 'long', day: 'numeric', month: 'long' })}</p>
       <h1>${greeting()}, Hanna!</h1>
       <p class="sub">${sub}</p>
-      ${done ? `<div class="progress"><i style="width:${(done / visible.length) * 100}%"></i></div>` : ''}
     </header>
-    ${needBackup ? `<button class="banner" data-action="settings">${icon('save')}
-      <span><b>Zeit für ein Backup</b>Dauert 5 Sekunden – sicher ist sicher.</span>${icon('right')}</button>` : ''}
-    ${groups.length > 1 ? `<div class="chips">${['*', ...groups].map(g =>
-      `<button class="chip${ui.group === g ? ' on' : ''}" data-action="group" data-group="${esc(g)}">${g === '*' ? 'Alle' : esc(groupName(g))}</button>`).join('')}</div>` : ''}
-    ${list}
-    <button class="add-btn" data-action="new-exercise">${icon('plus')} Übung hinzufügen</button>`;
+    ${backupBanner()}
+    <h2 class="section-title">Deine Pläne</h2>
+    <div class="cards">${data.plans.map(p => planCard(p, p === next)).join('')}</div>
+    <button class="add-btn" data-action="new-plan">${icon('plus')} Neuer Plan</button>`;
+}
+
+function planCard(p, isNext) {
+  const exs = exercisesOf(p.id);
+  const done = exs.filter(e => logOn(e.id, today())).length;
+  const last = lastTrained(p.id);
+  const meta = !exs.length ? 'Noch leer – tipp hier, um Übungen hinzuzufügen'
+    : `${plural(exs.length, 'Übung', 'Übungen')} · ${done ? `heute ${done} von ${exs.length}` : last ? `zuletzt ${relDay(last)}` : 'noch nicht trainiert'}`;
+  return `<button class="plan${isNext ? ' next' : ''}" data-action="open-plan" data-id="${p.id}">
+    <span class="plan-icon">${icon('dumbbell')}</span>
+    <span class="txt">
+      ${isNext ? `<span class="next-tag">${done ? 'Heute' : 'Heute dran'}</span>` : ''}
+      <span class="plan-name">${esc(p.name)}</span>
+      <span class="meta">${meta}</span>
+      ${exs.length ? `<span class="preview">${exs.map(e => esc(e.name)).join(' · ')}</span>` : ''}
+      ${progressBar(done, exs.length)}
+    </span>
+    ${icon('right')}
+  </button>`;
+}
+
+function viewWelcome() {
+  return `<section class="welcome">
+    ${LOGO}
+    <h1>Willkommen, Hanna!</h1>
+    <p>Leg zuerst deine Trainingspläne an. In jeden Plan kommen dann die passenden Übungen.</p>
+    <p class="eyebrow welcome-q">Wie trainierst du?</p>
+    <div class="templates">${TEMPLATES.map(([label, names], i) => `
+      <button class="template" data-action="template" data-id="${i}">
+        <span class="txt"><span class="plan-name">${label}</span><span class="meta">${plural(names.length, 'Plan', 'Pläne')}: ${names.join(', ')}</span></span>
+        ${icon('right')}
+      </button>`).join('')}
+    </div>
+    <button class="link" data-action="new-plan">${icon('edit')} Eigenen Plan anlegen</button>
+  </section>`;
+}
+
+function createFromTemplate(i) {
+  const plans = TEMPLATES[i][1].map(name => ({ id: uid(), name }));
+  data.plans.push(...plans);
+  if (plans.length === 1) ui.plan = plans[0].id;
+  save();
+  render();
+  window.scrollTo(0, 0);
+  toast(plans.length === 1 ? 'Plan angelegt – jetzt kommen die Übungen rein!' : `${plural(plans.length, 'Plan', 'Pläne')} angelegt – tipp einen an!`);
+}
+
+/* Training: ein Plan mit seinen Übungen */
+
+function viewPlan(plan) {
+  const exs = exercisesOf(plan.id);
+  const done = exs.filter(e => logOn(e.id, today())).length;
+  const last = lastTrained(plan.id);
+  const sub = !exs.length ? 'Füg die Übungen hinzu, die du an diesem Tag machst.'
+    : done === exs.length ? 'Alles geschafft für heute – stark! 🎉'
+    : done ? `Heute schon ${done} von ${exs.length} geschafft.`
+    : last ? `Zuletzt trainiert: ${relDay(last)}` : 'Tipp auf eine Übung, um dein Gewicht einzutragen.';
+
+  return `
+    <div class="plan-top">
+      <button class="back" data-action="back">${icon('left')} Pläne</button>
+      <button class="icon-btn soft" data-action="edit-plan" data-id="${plan.id}" aria-label="Plan bearbeiten">${icon('edit')}</button>
+    </div>
+    <header class="hello">
+      <h1>${esc(plan.name)}</h1>
+      <p class="sub">${sub}</p>
+      ${progressBar(done, exs.length)}
+    </header>
+    ${exs.length
+      ? `<div class="cards">${exs.map(cardExercise).join('')}</div>
+         <button class="add-btn" data-action="new-exercise">${icon('plus')} Übung hinzufügen</button>`
+      : picker(plan)}`;
 }
 
 function cardExercise(e) {
@@ -222,29 +347,30 @@ function cardExercise(e) {
   </button>`;
 }
 
-function viewWelcome() {
+// Leerer Plan: mehrere Übungen auf einmal antippen.
+function picker(plan) {
   const n = ui.picked.size;
-  return `<section class="welcome">
-    ${LOGO}
-    <h1>Willkommen, Hanna!</h1>
-    <p>Hier kommt dein Trainingsplan rein. Tipp die Geräte an, die du im Studio nutzt – die Gewichte trägst du danach ein.</p>
-    <div class="pick">${SUGGESTIONS.map(([name]) => {
+  return `<section class="picker">
+    <p class="picker-title">Welche Übungen gehören zu „${esc(plan.name)}“?</p>
+    <p class="picker-sub">Tipp sie in der Reihenfolge an, in der du sie machst.</p>
+    <div class="pick">${suggestionsFor(plan.name).map(name => {
       const on = ui.picked.has(name);
       return `<button class="chip${on ? ' on' : ''}" data-action="pick" data-id="${esc(name)}">${icon(on ? 'check' : 'plus')}${esc(name)}</button>`;
     }).join('')}</div>
     <button class="primary" data-action="add-picked" ${n ? '' : 'disabled'}>${n ? `${plural(n, 'Übung', 'Übungen')} hinzufügen` : 'Übungen auswählen'}</button>
-    <button class="link" data-action="new-exercise" style="margin-top:8px">${icon('edit')} Eigene Übung anlegen</button>
+    <button class="link" data-action="new-exercise">${icon('edit')} Eigene Übung anlegen</button>
   </section>`;
 }
 
 function addPicked() {
-  const picked = SUGGESTIONS.filter(([name]) => ui.picked.has(name));
-  if (!picked.length) return;
-  for (const [name, group, step = 2.5] of picked) data.exercises.push(newExercise({ name, group, step }));
+  const names = [...ui.picked];
+  if (!planById(ui.plan) || !names.length) return;
+  for (const name of names) data.exercises.push(newExercise({ name, planId: ui.plan, step: SMALL_STEPS.includes(name) ? 1 : 2.5 }));
   ui.picked.clear();
-  save(); render();
+  save();
+  render();
   window.scrollTo(0, 0);
-  toast(`${plural(picked.length, 'Übung', 'Übungen')} angelegt – tipp eine an!`);
+  toast(`${plural(names.length, 'Übung', 'Übungen')} hinzugefügt – tipp eine an!`);
 }
 
 /* Verlauf */
@@ -301,10 +427,12 @@ function dayCard(k) {
   const logs = data.logs.filter(l => l.date === k).sort((a, b) => a.ts - b.ts);
   const n = daysAgo(k);
   const tag = n === 0 ? 'heute' : n === 1 ? 'gestern' : '';
+  const plans = [...new Set(logs.map(l => planById(exById(l.exId)?.planId)?.name).filter(Boolean))];
+  const sub = [...plans.map(p => `<b>${esc(p)}</b>`), plural(logs.length, 'Übung', 'Übungen')].join(' · ');
   return `<article class="day" id="day-${k}">
     <header>
-      <h3>${fmtDate(k, { weekday: 'long', day: 'numeric', month: 'long' })}</h3>
-      ${tag ? `<span class="pill">${tag}</span>` : `<span class="count">${plural(logs.length, 'Übung', 'Übungen')}</span>`}
+      <div><h3>${fmtDate(k, { weekday: 'long', day: 'numeric', month: 'long' })}</h3><p class="day-sub">${sub}</p></div>
+      ${tag ? `<span class="pill">${tag}</span>` : ''}
     </header>
     ${logs.map(l => {
       const e = exById(l.exId);
@@ -343,13 +471,13 @@ function gotoDay(k) {
 /* Fortschritt */
 
 function viewProgress() {
-  const rows = data.exercises.map(e => ({ e, logs: logsOf(e.id) })).filter(r => r.logs.length);
+  const rows = data.exercises.map(e => ({ e, logs: logsOf(e.id) })).filter(r => r.logs.length)
+    .map(r => ({ ...r, gain: round2(r.logs.at(-1).weight - r.logs[0].weight) }));
   if (!rows.length) return `<h1 class="page-title">Fortschritt</h1>
     ${emptyState('chart', 'Hier wächst bald was', 'Trag deine Gewichte ein – dann siehst du hier, wie du von Woche zu Woche stärker wirst.')}`;
 
-  const gains = rows.map(r => round2(r.logs.at(-1).weight - r.logs[0].weight));
-  const total = round2(gains.filter(g => g > 0).reduce((a, b) => a + b, 0));
-  const improved = gains.filter(g => g > 0).length;
+  const total = round2(rows.reduce((sum, r) => sum + Math.max(0, r.gain), 0));
+  const improved = rows.filter(r => r.gain > 0).length;
   const month = today().slice(0, 7);
   const records = data.logs.filter(l => l.date.startsWith(month) && isRecord(l)).length;
   const monthName = new Date().toLocaleDateString('de-DE', { month: 'long' });
@@ -362,23 +490,24 @@ function viewProgress() {
        <div class="big">Los geht's!</div>
        <p>Steigere ein Gewicht – dann siehst du hier, wie viel stärker du geworden bist.</p>`;
 
+  const progRow = ({ e, logs, gain }) => `<button class="prog" data-action="detail" data-id="${e.id}">
+    <span class="txt">
+      <span class="name">${esc(e.name)}</span>
+      <span class="range">${kg(logs[0].weight)} → ${kg(logs.at(-1).weight)} kg</span>
+    </span>
+    ${sparkSVG(logs)}
+    <span class="delta${gain > 0 ? '' : ' flat'}">${gain > 0 ? '+' + kg(gain) : gain < 0 ? '−' + kg(-gain) : '±0'}<small>kg</small></span>
+  </button>`;
+
   return `<h1 class="page-title">Fortschritt</h1>
     <section class="hero">
       <svg class="hero-mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="currentColor">${H_SHAPE}</g></svg>
       ${hero}
       ${records ? `<span class="hero-pill">${icon('trophy')} ${plural(records, 'neuer Rekord', 'neue Rekorde')} im ${monthName}</span>` : ''}
     </section>
-    <h2 class="section-title">Deine Übungen</h2>
-    ${rows.map(({ e, logs }, i) => {
-      const g = gains[i];
-      return `<button class="prog" data-action="detail" data-id="${e.id}">
-        <span class="txt">
-          <span class="name">${esc(e.name)}</span>
-          <span class="range">${kg(logs[0].weight)} → ${kg(logs.at(-1).weight)} kg</span>
-        </span>
-        ${sparkSVG(logs)}
-        <span class="delta${g > 0 ? '' : ' flat'}">${g > 0 ? '+' + kg(g) : g < 0 ? '−' + kg(-g) : '±0'}<small>kg</small></span>
-      </button>`;
+    ${data.plans.map(p => {
+      const own = rows.filter(r => r.e.planId === p.id);
+      return own.length ? `<h2 class="group-title">${esc(p.name)}</h2>${own.map(progRow).join('')}` : '';
     }).join('')}`;
 }
 
@@ -457,13 +586,14 @@ function openSheet(sheet) {
   paintSheet();
 }
 
-function paintSheet() {
+function paintSheet(keepScroll = false) {
   const d = $('#sheet');
   const sheet = stack.at(-1);
   const html = sheet.html();
-  if (html == null) return closeSheet(); // Übung gibt es nicht mehr
+  if (html == null) return closeSheet(); // Übung oder Plan gibt es nicht mehr
+  const top = d.scrollTop;
   d.innerHTML = `<div class="sheet"><div class="grab"></div>${html}</div>`;
-  d.scrollTop = 0;
+  d.scrollTop = keepScroll ? top : 0;
   sheet.mount?.(d.firstElementChild);
 }
 
@@ -572,7 +702,7 @@ function saveLog(e, s) {
   if (entry) Object.assign(entry, values);
   else data.logs.push({ id: uid(), exId: e.id, date: s.date, ...values, ts: Date.now() });
 
-  // Der neueste Eintrag ist gleichzeitig der aktuelle Plan.
+  // Der neueste Eintrag ist gleichzeitig das aktuelle Gewicht der Übung.
   if (logsOf(e.id).at(-1).date === s.date) Object.assign(e, values);
 
   save();
@@ -590,7 +720,7 @@ function deleteLog(id) {
   const gone = data.logs.find(l => l.id === id);
   if (!gone) return;
   const e = exById(gone.exId);
-  const plan = { weight: e.weight, sets: e.sets, reps: e.reps };
+  const before = { weight: e.weight, sets: e.sets, reps: e.reps };
   data.logs = data.logs.filter(l => l !== gone);
   const latest = logsOf(e.id).at(-1);
   if (latest && gone.date > latest.date) Object.assign(e, { weight: latest.weight, sets: latest.sets, reps: latest.reps });
@@ -600,7 +730,7 @@ function deleteLog(id) {
   render();
   toast('Eintrag gelöscht', () => {
     data.logs.push(gone);
-    Object.assign(e, plan);
+    Object.assign(e, before);
     save();
     render();
     if (stack.length) paintSheet();
@@ -612,21 +742,20 @@ function deleteLog(id) {
 function exerciseSheet(id) {
   const e = id ? exById(id) : null;
   let step = e?.step ?? 2.5;
+  let planId = e?.planId ?? ui.plan;
 
   return {
     html() {
       if (id && !exById(id)) return null;
-      const groups = [...new Set([...usedGroups().filter(Boolean), ...GROUPS])];
-      const names = SUGGESTIONS.map(([n]) => n).filter(n => !data.exercises.some(x => x.name === n));
-      return `${head(e ? 'Übung bearbeiten' : 'Neue Übung')}
+      const plan = planById(planId);
+      if (!plan) return null;
+      const taken = new Set(exercisesOf(plan.id).map(x => x.name.toLowerCase()));
+      const suggestions = e ? [] : suggestionsFor(plan.name).filter(n => !taken.has(n.toLowerCase()));
+      return `${head(e ? 'Übung bearbeiten' : 'Neue Übung', e ? '' : `<p class="note">in ${esc(plan.name)}</p>`)}
         <label class="field"><span>Name</span>
-          <input id="f-name" value="${esc(e?.name)}" placeholder="z. B. Beinpresse" list="dl-names" autocomplete="off" enterkeyhint="next">
+          <input id="f-name" value="${esc(e?.name)}" placeholder="z. B. Beinpresse" autocomplete="off" enterkeyhint="done">
         </label>
-        <datalist id="dl-names">${names.map(n => `<option value="${esc(n)}">`).join('')}</datalist>
-        <div class="field"><span>Gruppe oder Trainingstag <i>· optional</i></span>
-          <input id="f-group" value="${esc(e?.group)}" placeholder="z. B. Beine oder Tag A" autocomplete="off">
-          <div class="chips">${groups.map(g => `<button class="chip" data-groupv="${esc(g)}">${esc(g)}</button>`).join('')}</div>
-        </div>
+        ${suggestions.length ? `<div class="chips">${suggestions.map(n => `<button class="chip" data-namev="${esc(n)}">${esc(n)}</button>`).join('')}</div>` : ''}
         <label class="field"><span>Notiz <i>· optional</i></span>
           <input id="f-note" value="${esc(e?.note)}" placeholder="z. B. Sitz auf Stufe 4" autocomplete="off">
         </label>
@@ -638,51 +767,55 @@ function exerciseSheet(id) {
         <div class="field"><span>Gewicht erhöhen in Schritten von</span>
           <div class="seg">${STEPS.map(v => `<button class="${v === step ? 'on' : ''}" data-stepv="${v}">${kg(v)} kg</button>`).join('')}</div>
         </div>
+        ${e && data.plans.length > 1 ? `<div class="field"><span>Gehört zum Plan</span>
+          <div class="chips">${data.plans.map(p => `<button class="chip${p.id === planId ? ' on' : ''}" data-planv="${p.id}">${esc(p.name)}</button>`).join('')}</div>
+        </div>` : ''}
         <div class="form-actions">
           <button class="primary" data-act="save">${icon('check')} Speichern</button>
-          ${e ? `<button class="link danger" data-act="delete" style="margin-top:8px">Übung löschen</button>` : ''}
+          ${e ? '<button class="link danger" data-act="delete">Übung löschen</button>' : ''}
         </div>`;
     },
     mount(root) {
-      const name = $('#f-name', root);
-      if (!e) name.focus();
+      const setStep = v => {
+        step = v;
+        root.querySelectorAll('[data-stepv]').forEach(x => x.classList.toggle('on', Number(x.dataset.stepv) === v));
+      };
       root.addEventListener('click', ev => {
         const b = ev.target.closest('button');
         if (!b) return;
-        if (b.dataset.groupv != null) $('#f-group', root).value = b.dataset.groupv;
-        else if (b.dataset.stepv) {
-          step = Number(b.dataset.stepv);
-          root.querySelectorAll('[data-stepv]').forEach(x => x.classList.toggle('on', x === b));
+        if (b.dataset.namev) {
+          $('#f-name', root).value = b.dataset.namev;
+          setStep(SMALL_STEPS.includes(b.dataset.namev) ? 1 : 2.5);
         }
-        else if (b.dataset.act === 'save') saveExercise(e, root, step);
+        else if (b.dataset.stepv) setStep(Number(b.dataset.stepv));
+        else if (b.dataset.planv) {
+          planId = b.dataset.planv;
+          root.querySelectorAll('[data-planv]').forEach(x => x.classList.toggle('on', x === b));
+        }
+        else if (b.dataset.act === 'save') saveExercise(e, root, step, planId);
         else if (b.dataset.act === 'delete') deleteExercise(e);
       });
     },
   };
 }
 
-function saveExercise(e, root, step) {
-  const field = id => $(id, root).value.trim();
-  const nameInput = $('#f-name', root);
+function saveExercise(e, root, step, planId) {
+  const field = sel => $(sel, root).value.trim();
   const name = field('#f-name');
-  if (!name) {
-    nameInput.classList.remove('shake');
-    void nameInput.offsetWidth;
-    nameInput.classList.add('shake');
-    nameInput.focus();
-    return;
-  }
-  // „beine“ wird zu „Beine“, wenn es die Gruppe schon gibt.
-  const rawGroup = field('#f-group');
-  const group = [...usedGroups(), ...GROUPS].find(g => g.toLowerCase() === rawGroup.toLowerCase()) || rawGroup;
+  if (!name) return shake($('#f-name', root));
   const values = {
-    name, group, note: field('#f-note'), step,
+    name, planId, step, note: field('#f-note'),
     weight: Math.max(0, round2(parseNum(field('#f-weight')))),
     sets: clamp(parseInt(field('#f-sets'), 10) || 3, 1, 99),
     reps: clamp(parseInt(field('#f-reps'), 10) || 10, 1, 99),
   };
-  if (e) Object.assign(e, values);
-  else data.exercises.push(newExercise(values));
+  if (e) {
+    const moved = e.planId !== planId;
+    Object.assign(e, values);
+    if (moved) data.exercises = [...data.exercises.filter(x => x !== e), e]; // ans Ende des neuen Plans
+  } else {
+    data.exercises.push(newExercise(values));
+  }
   save();
   closeSheet();
   render();
@@ -692,18 +825,103 @@ function saveExercise(e, root, step) {
 function deleteExercise(e) {
   const logs = data.logs.filter(l => l.exId === e.id);
   if (logs.length && !confirm(`„${e.name}“ wirklich löschen?\n\nAuch ${plural(logs.length, 'Eintrag', 'Einträge')} im Verlauf werden gelöscht.`)) return;
-  const index = data.exercises.indexOf(e);
-  data.exercises.splice(index, 1);
+  const before = snapshot();
+  data.exercises = data.exercises.filter(x => x !== e);
   data.logs = data.logs.filter(l => l.exId !== e.id);
   save();
   closeAll();
   render();
-  toast(`${e.name} gelöscht`, () => {
-    data.exercises.splice(index, 0, e);
-    data.logs.push(...logs);
-    save();
-    render();
-  });
+  toast(`${e.name} gelöscht`, () => { Object.assign(data, before); save(); render(); });
+}
+
+/* Plan anlegen / bearbeiten */
+
+function planSheet(id) {
+  const plan = id ? planById(id) : null;
+  let name = plan?.name ?? '';
+  const order = plan ? exercisesOf(plan.id).map(e => e.id) : [];
+
+  return {
+    html() {
+      if (id && !planById(id)) return null;
+      const taken = new Set(data.plans.filter(p => p !== plan).map(p => p.name.toLowerCase()));
+      const names = PLAN_NAMES.filter(n => !taken.has(n.toLowerCase()));
+      const rows = order.map((exId, i) => `<div class="plan-row">
+          <span class="pos">${i + 1}</span>
+          <span class="row-name">${esc(exById(exId)?.name)}</span>
+          <button class="mini" data-move="${i}" data-d="-1" ${i ? '' : 'disabled'} aria-label="Nach oben">${icon('up')}</button>
+          <button class="mini" data-move="${i}" data-d="1" ${i < order.length - 1 ? '' : 'disabled'} aria-label="Nach unten">${icon('down')}</button>
+        </div>`).join('');
+      return `${head(plan ? 'Plan bearbeiten' : 'Neuer Plan')}
+        <label class="field"><span>Name des Plans</span>
+          <input id="p-name" value="${esc(name)}" placeholder="z. B. Upper" autocomplete="off" enterkeyhint="done">
+        </label>
+        ${names.length ? `<div class="chips">${names.map(n => `<button class="chip" data-namev="${esc(n)}">${esc(n)}</button>`).join('')}</div>` : ''}
+        ${order.length > 1 ? `<h3 class="list-title">Reihenfolge der Übungen</h3>
+          <p class="list-sub">So, wie du sie im Gym machst.</p>
+          <div class="plan-list">${rows}</div>` : ''}
+        <div class="form-actions">
+          <button class="primary" data-act="save">${icon('check')} ${plan ? 'Speichern' : 'Plan anlegen'}</button>
+          ${plan ? '<button class="link danger" data-act="delete">Plan löschen</button>' : ''}
+        </div>`;
+    },
+    mount(root) {
+      const input = $('#p-name', root);
+      input.addEventListener('input', () => { name = input.value; });
+      input.addEventListener('keydown', ev => { if (ev.key === 'Enter') input.blur(); });
+      root.addEventListener('click', ev => {
+        const b = ev.target.closest('button');
+        if (!b) return;
+        if (b.dataset.namev) { name = b.dataset.namev; input.value = name; }
+        else if (b.dataset.move) {
+          const i = Number(b.dataset.move), j = i + Number(b.dataset.d);
+          [order[i], order[j]] = [order[j], order[i]];
+          paintSheet(true);
+        }
+        else if (b.dataset.act === 'save') savePlan(plan, name, order, root);
+        else if (b.dataset.act === 'delete') deletePlan(plan);
+      });
+    },
+  };
+}
+
+function savePlan(plan, rawName, order, root) {
+  const name = rawName.trim();
+  if (!name) return shake($('#p-name', root));
+  if (plan) {
+    plan.name = name;
+    // Übungen des Plans in der neuen Reihenfolge einsortieren
+    data.exercises = [...data.exercises.filter(e => e.planId !== plan.id), ...order.map(exById).filter(Boolean)];
+  } else {
+    const created = { id: uid(), name };
+    data.plans.push(created);
+    ui.plan = created.id;
+    ui.picked.clear();
+    ui.tab = 'training';
+  }
+  save();
+  closeSheet();
+  render();
+  window.scrollTo(0, 0);
+  toast(plan ? 'Gespeichert ✓' : `Plan „${name}“ angelegt – jetzt kommen die Übungen rein!`);
+}
+
+function deletePlan(plan) {
+  const exs = exercisesOf(plan.id);
+  const ids = new Set(exs.map(e => e.id));
+  const logs = data.logs.filter(l => ids.has(l.exId)).length;
+  const lost = [exs.length && plural(exs.length, 'Übung', 'Übungen'), logs && plural(logs, 'Eintrag', 'Einträge')].filter(Boolean);
+  if (lost.length && !confirm(`Plan „${plan.name}“ wirklich löschen?\n\nDabei werden auch ${lost.join(' und ')} gelöscht.`)) return;
+  const before = snapshot();
+  data.plans = data.plans.filter(p => p !== plan);
+  data.exercises = data.exercises.filter(e => !ids.has(e.id));
+  data.logs = data.logs.filter(l => !ids.has(l.exId));
+  ui.plan = null;
+  save();
+  closeAll();
+  render();
+  window.scrollTo(0, 0);
+  toast(`Plan „${plan.name}“ gelöscht`, () => { Object.assign(data, before); save(); render(); });
 }
 
 /* Detail einer Übung */
@@ -714,7 +932,7 @@ function detailSheet(id) {
       const e = exById(id);
       if (!e) return null;
       const logs = logsOf(id);
-      const sub = [e.group, e.note].filter(Boolean).map(esc).join(' · ');
+      const sub = [planById(e.planId)?.name, e.note].filter(Boolean).map(esc).join(' · ');
       const todayLog = logOn(id, today());
       const actions = `<button class="primary" data-action="log" data-id="${id}">${icon(todayLog ? 'edit' : 'plus')} ${todayLog ? 'Heute bearbeiten' : 'Heute eintragen'}</button>
         <div class="sheet-links"><button class="link" data-action="edit-exercise" data-id="${id}">${icon('edit')} Übung bearbeiten</button></div>`;
@@ -759,7 +977,8 @@ function settingsSheet() {
       </section>
       <section class="panel">
         <h3>${icon('info')} So geht's</h3>
-        <p>Tipp im Training auf eine Übung, stell das Gewicht mit + und − ein und drück „Eintragen“. Die App merkt sich dein Gewicht fürs nächste Mal.</p>
+        <p>Leg für jeden Trainingstag einen Plan an, z. B. „Upper“ und „Lower“, und füg dort deine Übungen hinzu.</p>
+        <p>Im Gym tippst du auf den Plan, dann auf eine Übung, stellst das Gewicht mit + und − ein und drückst „Eintragen“. Die App merkt sich dein Gewicht fürs nächste Mal.</p>
       </section>
       <p class="credit">Hantel-Hanna · mit ♥ gebaut von Jonas</p>`,
     mount(root) {
@@ -801,9 +1020,10 @@ async function importBackup(file) {
   let backup;
   try { backup = sanitize(JSON.parse(await file.text())); } catch { backup = null; }
   if (!backup) return toast('Das ist leider kein Hantel-Hanna-Backup.');
-  const ok = confirm(`Backup laden?\n\nDarin: ${plural(backup.exercises.length, 'Übung', 'Übungen')}, ${plural(backup.logs.length, 'Eintrag', 'Einträge')}.\nDeine jetzigen Daten auf diesem Handy werden ersetzt.`);
+  const ok = confirm(`Backup laden?\n\nDarin: ${plural(backup.plans.length, 'Plan', 'Pläne')}, ${plural(backup.exercises.length, 'Übung', 'Übungen')}, ${plural(backup.logs.length, 'Eintrag', 'Einträge')}.\nDeine jetzigen Daten auf diesem Handy werden ersetzt.`);
   if (!ok) return;
   data = backup;
+  ui.plan = null;
   save();
   closeAll();
   render();
@@ -861,6 +1081,8 @@ document.addEventListener('click', ev => {
   const t = ev.target.closest('[data-tab], [data-action]');
   if (!t) return;
   if (t.dataset.tab) {
+    // Nochmal auf „Training“ tippen führt zurück zur Plan-Übersicht.
+    if (t.dataset.tab === 'training' && ui.tab === 'training') ui.plan = null;
     ui.tab = t.dataset.tab;
     render();
     window.scrollTo(0, 0);
@@ -868,16 +1090,20 @@ document.addEventListener('click', ev => {
   }
   const { id } = t.dataset;
   switch (t.dataset.action) {
+    case 'open-plan': ui.plan = id; ui.picked.clear(); render(); window.scrollTo(0, 0); break;
+    case 'back': ui.plan = null; ui.picked.clear(); render(); window.scrollTo(0, 0); break;
+    case 'template': createFromTemplate(Number(id)); break;
+    case 'new-plan': openSheet(planSheet()); break;
+    case 'edit-plan': openSheet(planSheet(id)); break;
+    case 'pick': ui.picked.has(id) ? ui.picked.delete(id) : ui.picked.add(id); render(); break;
+    case 'add-picked': addPicked(); break;
+    case 'new-exercise': openSheet(exerciseSheet()); break;
+    case 'edit-exercise': openSheet(exerciseSheet(id)); break;
     case 'log': openSheet(logSheet(id)); break;
     case 'edit-log': openSheet(logSheet(t.dataset.ex, t.dataset.date)); break;
     case 'detail': openSheet(detailSheet(id)); break;
-    case 'new-exercise': openSheet(exerciseSheet()); break;
-    case 'edit-exercise': openSheet(exerciseSheet(id)); break;
     case 'settings': openSheet(settingsSheet()); break;
     case 'close': closeSheet(); break;
-    case 'group': ui.group = t.dataset.group; render(); break;
-    case 'pick': ui.picked.has(id) ? ui.picked.delete(id) : ui.picked.add(id); render(); break;
-    case 'add-picked': addPicked(); break;
     case 'month': ui.month = shiftMonth(ui.month, Number(t.dataset.d)); render(); break;
     case 'goto-day': gotoDay(t.dataset.date); break;
   }
